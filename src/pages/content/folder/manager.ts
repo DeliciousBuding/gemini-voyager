@@ -9,6 +9,7 @@ import { FolderImportExportService } from '@/features/folder/services/FolderImpo
 import type { ImportStrategy } from '@/features/folder/types/import-export';
 import { getTranslationSync, getTranslationSyncUnsafe, initI18n } from '@/utils/i18n';
 
+import { sortConversationsByPriority } from './conversationSort';
 import { FOLDER_COLORS, getFolderColor, isDarkMode } from './folderColors';
 import { DEFAULT_CONVERSATION_ICON, DEFAULT_GEM_ICON, GEM_CONFIG, getGemIcon } from './gemConfig';
 import { createMoveToFolderMenuItem } from './moveToFolderMenuItem';
@@ -22,9 +23,10 @@ const STORAGE_KEY = 'gvFolderData';
 const IS_DEBUG = false; // Set to true to enable debug logging
 const ROOT_CONVERSATIONS_ID = '__root_conversations__'; // Special ID for root-level conversations
 const NOTIFICATION_TIMEOUT_MS = 10000; // Duration to show data loss notification
-const FOLDER_TREE_INDENT_MIN = 8;
+const FOLDER_TREE_INDENT_MIN = -8;
 const FOLDER_TREE_INDENT_MAX = 32;
-const FOLDER_TREE_INDENT_DEFAULT = 16;
+const FOLDER_TREE_INDENT_DEFAULT = -8;
+const FOLDER_NAME_SINGLE_CLICK_DELAY_MS = 220;
 
 // Export session backup keys for use by FolderImportExportService (deprecated, kept for compatibility)
 export const SESSION_BACKUP_KEY = 'gvFolderBackup';
@@ -37,15 +39,15 @@ export function clampFolderTreeIndent(value: unknown): number {
 }
 
 export function calculateFolderHeaderPaddingLeft(level: number, indent: number): number {
-  return level * indent + 8;
+  return Math.max(0, level * indent + 8);
 }
 
 export function calculateFolderConversationPaddingLeft(level: number, indent: number): number {
-  return level * indent + 24;
+  return Math.max(0, level * indent + 24);
 }
 
 export function calculateFolderDialogPaddingLeft(level: number, indent: number): number {
-  return level * indent + 12;
+  return Math.max(0, level * indent + 12);
 }
 
 /**
@@ -98,6 +100,7 @@ export class FolderManager {
   private multiSelectSource: 'folder' | 'native' | null = null; // Track where multi-select was initiated
   private multiSelectFolderId: string | null = null; // Track which folder multi-select was initiated from
   private longPressTimeout: number | null = null; // For long-press detection
+  private folderNameClickTimeout: number | null = null; // Distinguish single-click toggle from double-click rename
   private longPressThreshold: number = 500; // Long-press duration in ms
   private folderEnabled: boolean = true; // Whether folder feature is enabled
   private hideArchivedConversations: boolean = false; // Whether to hide conversations in folders
@@ -242,6 +245,11 @@ export class FolderManager {
       this.longPressTimeout = null;
     }
 
+    if (this.folderNameClickTimeout !== null) {
+      clearTimeout(this.folderNameClickTimeout);
+      this.folderNameClickTimeout = null;
+    }
+
     if (this.tooltipTimeout) {
       clearTimeout(this.tooltipTimeout);
       this.tooltipTimeout = null;
@@ -350,6 +358,52 @@ export class FolderManager {
     // Set up native conversation menu injection
     this.setupConversationClickTracking();
     this.setupNativeConversationMenuObserver();
+
+    // ─── DOM recovery (resize / print) ─────────────────────────────────────
+    // Gemini may re-render the sidebar DOM during window resize or
+    // window.print(), detaching the folder container.  The sideNavObserver
+    // (watching `side-nav-open` on #app-root) CANNOT catch all cases because
+    // when the sidebar closes AND the DOM is rebuilt simultaneously, the
+    // observer fires with isSideNavOpen=false and skips reinitialization.
+    // A debounced resize listener provides a reliable fallback.
+    let domRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const domRecoveryCheck = () => {
+      if (domRecoveryTimer !== null) clearTimeout(domRecoveryTimer);
+      domRecoveryTimer = setTimeout(() => {
+        domRecoveryTimer = null;
+        if (this.isDestroyed) return;
+        if (
+          this.containerElement &&
+          document.body.contains(this.containerElement) &&
+          this.sidebarContainer &&
+          document.body.contains(this.sidebarContainer)
+        ) {
+          return; // Everything still attached – nothing to do.
+        }
+        // Only reinitialize if the sidebar is currently visible (open).
+        // If it is closed, the sideNavObserver will trigger reinitialization
+        // when it reopens.
+        const appRoot = document.querySelector('#app-root');
+        if (appRoot && !appRoot.classList.contains('side-nav-open')) {
+          this.debug('DOM recovery: container lost but sidebar closed, deferring');
+          return;
+        }
+        this.debug('DOM recovery: folder UI lost from DOM, reinitializing');
+        this.reinitializeFolderUI();
+      }, 800);
+    };
+
+    window.addEventListener('resize', domRecoveryCheck);
+    window.addEventListener('gv-print-cleanup', domRecoveryCheck);
+    window.addEventListener('afterprint', domRecoveryCheck);
+
+    this.addCleanupTask(() => {
+      if (domRecoveryTimer !== null) clearTimeout(domRecoveryTimer);
+      window.removeEventListener('resize', domRecoveryCheck);
+      window.removeEventListener('gv-print-cleanup', domRecoveryCheck);
+      window.removeEventListener('afterprint', domRecoveryCheck);
+    });
   }
 
   private async waitForSidebar(): Promise<void> {
@@ -600,7 +654,7 @@ export class FolderManager {
       // Cloud upload button
       const cloudUploadButton = document.createElement('button');
       cloudUploadButton.className = 'gv-folder-action-btn';
-      cloudUploadButton.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3"><path d="M260-160q-91 0-155.5-63T40-377q0-78 47-139t123-78q25-92 100-149t170-57q117 0 198.5 81.5T760-520q69 8 114.5 59.5T920-340q0 75-52.5 127.5T740-160H520q-33 0-56.5-23.5T440-240v-206l-64 62-56-56 160-160 160 160-56 56-64-62v206h220q42 0 71-29t29-71q0-42-29-71t-71-29h-60v-80q0-83-58.5-141.5T480-720q-83 0-141.5 58.5T280-520h-20q-58 0-99 41t-41 99q0 58 41 99t99 41h100v80H260Zm220-280Z"/></svg>`;
+      cloudUploadButton.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="currentColor"><path d="M260-160q-91 0-155.5-63T40-377q0-78 47-139t123-78q25-92 100-149t170-57q117 0 198.5 81.5T760-520q69 8 114.5 59.5T920-340q0 75-52.5 127.5T740-160H520q-33 0-56.5-23.5T440-240v-206l-64 62-56-56 160-160 160 160-56 56-64-62v206h220q42 0 71-29t29-71q0-42-29-71t-71-29h-60v-80q0-83-58.5-141.5T480-720q-83 0-141.5 58.5T280-520h-20q-58 0-99 41t-41 99q0 58 41 99t99 41h100v80H260Zm220-280Z"/></svg>`;
       cloudUploadButton.title = this.t('folder_cloud_upload');
       cloudUploadButton.addEventListener('click', () => this.handleCloudUpload());
       // Add dynamic tooltip on mouseenter
@@ -613,7 +667,7 @@ export class FolderManager {
       // Cloud sync button
       const cloudSyncButton = document.createElement('button');
       cloudSyncButton.className = 'gv-folder-action-btn';
-      cloudSyncButton.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3"><path d="M260-160q-91 0-155.5-63T40-377q0-78 47-139t123-78q17-72 85-137t145-65q33 0 56.5 23.5T520-716v242l64-62 56 56-160 160-160-160 56-56 64 62v-242q-76 14-118 73.5T280-520h-20q-58 0-99 41t-41 99q0 58 41 99t99 41h480q42 0 71-29t29-71q0-42-29-71t-71-29h-60v-80q0-48-22-89.5T600-680v-93q74 35 117 103.5T760-520q69 8 114.5 59.5T920-340q0 75-52.5 127.5T740-160H260Zm220-358Z"/></svg>`;
+      cloudSyncButton.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="currentColor"><path d="M260-160q-91 0-155.5-63T40-377q0-78 47-139t123-78q17-72 85-137t145-65q33 0 56.5 23.5T520-716v242l64-62 56 56-160 160-160-160 56-56 64 62v-242q-76 14-118 73.5T280-520h-20q-58 0-99 41t-41 99q0 58 41 99t99 41h480q42 0 71-29t29-71q0-42-29-71t-71-29h-60v-80q0-48-22-89.5T600-680v-93q74 35 117 103.5T760-520q69 8 114.5 59.5T920-340q0 75-52.5 127.5T740-160H260Zm220-358Z"/></svg>`;
       cloudSyncButton.title = this.t('folder_cloud_sync');
       cloudSyncButton.addEventListener('click', () => this.handleCloudSync());
       // Add dynamic tooltip on mouseenter
@@ -653,7 +707,8 @@ export class FolderManager {
     const rootConversations = this.data.folderContents[ROOT_CONVERSATIONS_ID] || [];
     const filteredRootConversations = this.filterConversationsByCurrentUser(rootConversations);
     if (filteredRootConversations.length > 0) {
-      filteredRootConversations.forEach((conv) => {
+      const sortedRootConversations = this.sortConversations(filteredRootConversations);
+      sortedRootConversations.forEach((conv) => {
         const convEl = this.createConversationElement(conv, ROOT_CONVERSATIONS_ID, 0);
         list.appendChild(convEl);
       });
@@ -723,8 +778,8 @@ export class FolderManager {
     folderName.className = 'gv-folder-name gds-label-l';
     folderName.textContent = folder.name;
     folderName.style.cursor = 'pointer';
-    folderName.addEventListener('click', () => this.toggleFolder(folder.id));
-    folderName.addEventListener('dblclick', () => this.renameFolder(folder.id));
+    folderName.addEventListener('click', (event) => this.handleFolderNameClick(folder.id, event));
+    folderName.addEventListener('dblclick', () => this.handleFolderNameDoubleClick(folder.id));
 
     // Add tooltip event listeners
     folderName.addEventListener('mouseenter', () => this.showTooltip(folderName, folder.name));
@@ -799,6 +854,31 @@ export class FolderManager {
     }
 
     return folderEl;
+  }
+
+  private clearPendingFolderNameClick(): void {
+    if (this.folderNameClickTimeout === null) return;
+    clearTimeout(this.folderNameClickTimeout);
+    this.folderNameClickTimeout = null;
+  }
+
+  private handleFolderNameClick(folderId: string, event: MouseEvent): void {
+    // Double-click dispatches a second click with detail > 1; skip toggle for that sequence.
+    if (event.detail > 1) {
+      this.clearPendingFolderNameClick();
+      return;
+    }
+
+    this.clearPendingFolderNameClick();
+    this.folderNameClickTimeout = window.setTimeout(() => {
+      this.folderNameClickTimeout = null;
+      this.toggleFolder(folderId);
+    }, FOLDER_NAME_SINGLE_CLICK_DELAY_MS);
+  }
+
+  private handleFolderNameDoubleClick(folderId: string): void {
+    this.clearPendingFolderNameClick();
+    this.renameFolder(folderId);
   }
 
   private createConversationElement(
@@ -1964,6 +2044,8 @@ export class FolderManager {
   }
 
   private renameFolder(folderId: string): void {
+    this.clearPendingFolderNameClick();
+
     const folder = this.data.folders.find((f) => f.id === folderId);
     if (!folder) return;
 
@@ -2166,14 +2248,7 @@ export class FolderManager {
   }
 
   private sortConversations(conversations: ConversationReference[]): ConversationReference[] {
-    return [...conversations].sort((a, b) => {
-      // Starred conversations always come first
-      if (a.starred && !b.starred) return -1;
-      if (!a.starred && b.starred) return 1;
-
-      // Within the same starred state, sort by addedAt (newest first)
-      return b.addedAt - a.addedAt;
-    });
+    return sortConversationsByPriority(conversations);
   }
 
   private addConversationToFolder(
@@ -5164,7 +5239,48 @@ export class FolderManager {
       gemId: conv.gemId,
     });
 
+    this.markConversationAsRecentlyOpened(conversationId);
     this.navigateToConversation(conv.url, conv);
+  }
+
+  private isSameConversation(targetId: string, conversation: ConversationReference): boolean {
+    if (conversation.conversationId === targetId) return true;
+
+    const cleanId = targetId.replace(/^c_/, '');
+    const cleanStoredId = conversation.conversationId.replace(/^c_/, '');
+
+    if (cleanId && cleanId === cleanStoredId) return true;
+
+    if (cleanId && cleanId.length > 8 && conversation.url.includes(cleanId)) return true;
+
+    return false;
+  }
+
+  private markConversationAsRecentlyOpened(conversationId: string): void {
+    const now = Date.now();
+    let changed = false;
+
+    for (const folderId in this.data.folderContents) {
+      const conversations = this.data.folderContents[folderId];
+      conversations.forEach((conversation) => {
+        if (!this.isSameConversation(conversationId, conversation)) return;
+
+        // De-duplicate near-simultaneous route/listener updates.
+        if (conversation.lastOpenedAt && now - conversation.lastOpenedAt < 1000) return;
+
+        conversation.lastOpenedAt = now;
+        conversation.updatedAt = now;
+        changed = true;
+      });
+    }
+
+    if (!changed) return;
+
+    void this.saveData();
+
+    if (this.folderEnabled && this.containerElement) {
+      this.renderAllFolders();
+    }
   }
 
   private navigateToConversation(url: string, conversation?: ConversationReference): void {
@@ -5298,7 +5414,13 @@ export class FolderManager {
   private installRouteChangeListener(): void {
     const update = () => {
       if (this.isDestroyed) return;
-      setTimeout(() => this.highlightActiveConversationInFolders(), 0);
+      setTimeout(() => {
+        this.highlightActiveConversationInFolders();
+        const currentConversationId = this.getCurrentConversationId();
+        if (currentConversationId) {
+          this.markConversationAsRecentlyOpened(currentConversationId);
+        }
+      }, 0);
     };
 
     const cleanupFns: (() => void)[] = [];

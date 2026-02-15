@@ -148,6 +148,25 @@ function normalizeText(text: string | null): string {
 
 // Note: cleaning of thinking toggles is handled at DOM level in extractAssistantText
 
+/**
+ * querySelector variant that skips elements nested inside model-thoughts / thoughts-container.
+ * When the user expands Gemini's "thinking" section, a second `message-content` element
+ * appears *before* the real response in DOM order.  A plain `querySelector` would match
+ * the thinking panel first, causing exports to grab the wrong content.
+ */
+function queryOutsideThoughts<T extends Element = Element>(
+  root: Element,
+  selector: string,
+): T | null {
+  const candidates = root.querySelectorAll<T>(selector);
+  for (const el of Array.from(candidates)) {
+    if (!el.closest('model-thoughts, .thoughts-container, .thoughts-content')) {
+      return el;
+    }
+  }
+  return null;
+}
+
 function filterTopLevel(elements: Element[]): HTMLElement[] {
   const arr = elements.map((e) => e as HTMLElement);
   const out: HTMLElement[] = [];
@@ -259,10 +278,13 @@ function readStarredSet(): Set<string> {
 
 function extractAssistantText(el: HTMLElement): string {
   // Prefer direct text from message container if available (connected to DOM)
+  // Use queryOutsideThoughts to avoid matching the message-content inside
+  // the expanded thinking/reasoning panel.
   try {
-    const mc = el.querySelector(
+    const mc = queryOutsideThoughts<HTMLElement>(
+      el,
       'message-content, .markdown, .markdown-main-panel',
-    ) as HTMLElement | null;
+    );
     if (mc) {
       const raw = mc.textContent || mc.innerText || '';
       const txt = normalizeText(raw);
@@ -378,13 +400,14 @@ function collectChatPairs(): ChatTurn[] {
       let finalAssistantEl: HTMLElement | undefined = undefined;
       if (aEl) {
         const pick =
-          (aEl.querySelector('message-content') as HTMLElement | null) ||
-          (aEl.querySelector('.markdown, .markdown-main-panel') as HTMLElement | null) ||
+          queryOutsideThoughts<HTMLElement>(aEl, 'message-content') ||
+          queryOutsideThoughts<HTMLElement>(aEl, '.markdown, .markdown-main-panel') ||
           (aEl.closest('.presented-response-container') as HTMLElement | null) ||
-          (aEl.querySelector(
+          queryOutsideThoughts<HTMLElement>(
+            aEl,
             '.presented-response-container, .response-content',
-          ) as HTMLElement | null) ||
-          (aEl.querySelector('response-element') as HTMLElement | null) ||
+          ) ||
+          queryOutsideThoughts<HTMLElement>(aEl, 'response-element') ||
           aEl;
         finalAssistantEl = pick || undefined;
       }
@@ -1344,8 +1367,7 @@ async function performFinalExport(
       } catch {}
     };
 
-    checkbox.addEventListener('click', (ev) => {
-      swallow(ev);
+    const toggleSelection = () => {
       autoSelectAll = false;
       const next = !selectedIds.has(msg.messageId);
       setSelected(msg.messageId, next);
@@ -1353,7 +1375,15 @@ async function performFinalExport(
         '[data-gv-export-select-bar="true"]',
       ) as HTMLElement | null;
       if (bar) updateBottomBar(bar);
+    };
+
+    checkbox.addEventListener('click', (ev) => {
+      swallow(ev);
+      toggleSelection();
     });
+
+    host.addEventListener('click', toggleSelection);
+    cleanupTasks.push(() => host.removeEventListener('click', toggleSelection));
 
     selector.appendChild(checkbox);
     host.appendChild(selector);
@@ -1484,11 +1514,23 @@ async function performFinalExport(
       title: getConversationTitleForExport(),
     };
 
+    let includeImageSource = true;
+    if (format === 'markdown') {
+      const hasSearchImages = turnsForExport.some(
+        (turn) =>
+          turn.assistantElement?.querySelector('.attachment-container.search-images') != null,
+      );
+      if (hasSearchImages) {
+        includeImageSource = confirm(t('export_md_include_source_confirm'));
+      }
+    }
+
     const hideProgress = showExportProgressOverlay(t);
     try {
       const resultPromise = ConversationExportService.export(turnsForExport, metadata, {
         format,
         fontSize,
+        includeImageSource,
       });
       const minVisiblePromise = new Promise((resolve) => setTimeout(resolve, 420));
       const [result] = await Promise.all([resultPromise, minVisiblePromise]);
@@ -2081,6 +2123,79 @@ export async function startExportButton(): Promise<void> {
       } catch {}
     }
   });
+
+  // ─── DOM recovery (resize / print) ─────────────────────────────────────
+  // Gemini may re-render the logo/header area (and thus destroy the wrapper
+  // + export button) during window resize or window.print().  We use a
+  // single debounced handler that fires on resize, afterprint, and our own
+  // gv-print-cleanup event.  It checks whether the button is still attached
+  // and re-injects if not.
+  let currentBtn: HTMLButtonElement = btn;
+  let reinjectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const reinjectExportButtonIfNeeded = () => {
+    // Debounce: Gemini fires many mutations during resize; wait until it
+    // settles before we attempt re-injection.
+    if (reinjectTimer !== null) clearTimeout(reinjectTimer);
+    reinjectTimer = setTimeout(() => {
+      reinjectTimer = null;
+      try {
+        // If the button is still in the document, nothing to do.
+        if (document.body.contains(currentBtn)) return;
+
+        // Remove stale wrapper if it somehow survived but lost the button.
+        const staleWrapper = document.querySelector('.gv-logo-dropdown-wrapper');
+        if (staleWrapper) staleWrapper.remove();
+
+        // Re-find the logo element (Gemini may have created a fresh one).
+        const newLogo =
+          document.querySelector('[data-test-id="logo"]') ?? document.querySelector('.logo');
+        if (!newLogo) return;
+
+        const newBtn = ensureDropdownInjected(newLogo);
+        if (!newBtn) return;
+        if ((newBtn as any)._gvBound) return;
+        (newBtn as any)._gvBound = true;
+
+        // Re-bind all event listeners on the fresh button.
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach((type) => {
+          try {
+            newBtn.addEventListener(type, swallow, true);
+          } catch {}
+        });
+
+        const freshT = (key: TranslationKey) => dict[lang]?.[key] ?? dict.en?.[key] ?? key;
+        const ttl = freshT('exportChatJson');
+        const lbl = freshT('pm_export');
+        newBtn.title = ttl;
+        newBtn.setAttribute('aria-label', ttl);
+        const labelEl = newBtn.querySelector('.gv-export-dropdown-label');
+        if (labelEl) labelEl.textContent = lbl;
+
+        newBtn.addEventListener('click', (ev) => {
+          swallow(ev);
+          try {
+            showExportDialog(dict, lang);
+          } catch (err) {
+            try {
+              console.error('Gemini Voyager export failed', err);
+            } catch {}
+          }
+        });
+
+        // Update our tracking reference so the next check uses the new element.
+        currentBtn = newBtn;
+      } catch (e) {
+        try {
+          console.debug('[Gemini Voyager] Export button re-injection failed:', e);
+        } catch {}
+      }
+    }, 800);
+  };
+
+  window.addEventListener('resize', reinjectExportButtonIfNeeded);
+  window.addEventListener('gv-print-cleanup', reinjectExportButtonIfNeeded);
+  window.addEventListener('afterprint', reinjectExportButtonIfNeeded);
 }
 
 async function showExportDialog(
