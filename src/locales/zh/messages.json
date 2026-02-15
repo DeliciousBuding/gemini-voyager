@@ -1048,6 +1048,14 @@
     "message": "在对话中选中文字时显示悬浮按钮，用于引用所选内容",
     "description": "引用回复功能提示"
   },
+  "enableMessageTimestamp": {
+    "message": "显示消息时间戳",
+    "description": "启用消息时间戳开关标签"
+  },
+  "enableMessageTimestampHint": {
+    "message": "在AI回复下方显示发送时间",
+    "description": "消息时间戳功能提示"
+  },
   "contextSync": {
     "message": "上下文同步",
     "description": "上下文同步标题"
